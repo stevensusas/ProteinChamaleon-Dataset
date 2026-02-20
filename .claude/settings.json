@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda run -n proteinchameleon pytest:*)",
+      "Bash(conda run -n proteinchameleon python3:*)"
+    ]
+  }
+}

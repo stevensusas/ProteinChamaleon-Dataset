@@ -1,0 +1,15 @@
+# HTTP client
+httpx>=0.27.0
+
+# Schema validation
+pydantic>=2.0.0
+
+# Neo4j driver
+neo4j>=5.0.0
+
+# Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+
+# Optional: progress bars for demo
+tqdm>=4.66.0
