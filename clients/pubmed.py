@@ -137,6 +137,24 @@ def _parse_efetch_xml(xml_content: bytes) -> list[PubMedArticle]:
     return articles
 
 
+def _parse_pmc_full_text(xml_content: bytes) -> str:
+    """Extract concatenated paragraph text from a PMC full-text XML payload."""
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        return ""
+
+    paragraphs: list[str] = []
+    for el in root.iter():
+        # Handle both namespaced and non-namespaced tags.
+        if el.tag == "p" or str(el.tag).endswith("}p"):
+            text = "".join(el.itertext()).strip()
+            if text:
+                paragraphs.append(" ".join(text.split()))
+
+    return "\n\n".join(paragraphs)
+
+
 # ── Client ────────────────────────────────────────────────────────────────────
 
 class PubMedClient(BaseClient):
@@ -267,3 +285,25 @@ class PubMedClient(BaseClient):
     def fetch_by_pmids(self, pmids: list[str]) -> list[PubMedArticle]:
         """Fetch articles directly by a list of PMIDs."""
         return self.fetch(pmids=pmids)
+
+    def fetch_pmc_full_text(self, pmc: str) -> Optional[str]:
+        """
+        Fetch full text from PMC (when available) as plain concatenated paragraphs.
+        Returns None if not available or retrieval/parsing fails.
+        """
+        if not pmc:
+            return None
+        pmc_id = pmc if pmc.upper().startswith("PMC") else f"PMC{pmc}"
+        params = {
+            **self._base_params(),
+            "db": "pmc",
+            "id": pmc_id,
+            "rettype": "full",
+            "retmode": "xml",
+        }
+        try:
+            resp = self._get(f"{self.BASE_URL}/efetch.fcgi", params=params)
+            text = _parse_pmc_full_text(resp.content)
+            return text or None
+        except Exception:
+            return None

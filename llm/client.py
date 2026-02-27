@@ -108,7 +108,12 @@ class ProteinDescriptionLLMClient:
             },
         }
 
-    def _build_messages(self, accession: str, context: dict[str, Any]) -> list[dict[str, str]]:
+    def _build_messages(
+        self,
+        accession: str,
+        context: dict[str, Any],
+        structure_files: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, str]]:
         compact = self._context_for_prompt(context)
         return [
             {
@@ -117,11 +122,15 @@ class ProteinDescriptionLLMClient:
             },
             {
                 "role": "user",
-                "content": build_user_prompt(accession, compact),
+                "content": build_user_prompt(accession, compact, structure_files=structure_files),
             },
         ]
 
-    def describe_protein(self, accession: str) -> str:
+    def describe_protein(
+        self,
+        accession: str,
+        structure_files: list[dict[str, Any]] | None = None,
+    ) -> str:
         """Fetch Neo4j context for accession and return an LLM-generated description."""
         context = self.neo4j.get_protein_context(accession)
         if not context.get("protein"):
@@ -129,7 +138,9 @@ class ProteinDescriptionLLMClient:
 
         payload = {
             "model": self.config.model,
-            "messages": self._build_messages(accession, context),
+            "messages": self._build_messages(
+                accession, context, structure_files=structure_files
+            ),
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
         }

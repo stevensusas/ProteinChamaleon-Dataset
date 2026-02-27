@@ -43,6 +43,7 @@ class GraphExpansionPipeline:
     """
 
     _PMID_RE = re.compile(r"PMID[:\s]?(\d+)", re.IGNORECASE)
+    _PMC_FULL_TEXT_MAX_CHARS = 100_000
 
     def __init__(
         self,
@@ -128,13 +129,28 @@ class GraphExpansionPipeline:
                 for pmid in missing:
                     article = fetched.get(pmid)
                     if article:
+                        full_text = ""
+                        if article.pmc:
+                            pmc_text = self.pubmed.fetch_pmc_full_text(article.pmc)
+                            if pmc_text:
+                                full_text = pmc_text[: self._PMC_FULL_TEXT_MAX_CHARS]
                         self._pubmed_cache[pmid] = {
                             "pmid": article.pmid,
                             "title": article.title or "",
+                            "abstract": article.abstract or "",
                             "journal": article.journal or "",
+                            "journal_abbrev": article.journal_abbrev or "",
                             "year": article.year or "",
+                            "volume": article.volume or "",
+                            "issue": article.issue or "",
+                            "pages": article.pages or "",
                             "doi": article.doi or "",
+                            "pmc": article.pmc or "",
+                            "pubmed_url": article.pubmed_url,
                             "authors": article.author_names,
+                            "mesh_terms": article.mesh_terms,
+                            "publication_types": article.publication_types,
+                            "full_text": full_text,
                         }
                     else:
                         self._pubmed_cache[pmid] = {"pmid": pmid}
@@ -186,15 +202,30 @@ class GraphExpansionPipeline:
         # PDB structures (from PDB Search API)
         try:
             pdb_result = self.pdb.search_by_uniprot(accession, max_rows=100)
-            protein_props["pdb_ids"] = pdb_result.identifiers
+            pdb_ids = pdb_result.identifiers
+            protein_props["pdb_ids"] = pdb_ids
+            protein_props["pdb_entry_urls"] = [
+                f"https://www.rcsb.org/structure/{pdb_id}" for pdb_id in pdb_ids
+            ]
+            protein_props["pdb_cif_urls"] = [
+                f"https://files.rcsb.org/download/{pdb_id}.cif" for pdb_id in pdb_ids
+            ]
+            protein_props["pdb_pdb_urls"] = [
+                f"https://files.rcsb.org/download/{pdb_id}.pdb" for pdb_id in pdb_ids
+            ]
         except Exception as exc:
             logger.warning("PDB search failed for %s: %s", accession, exc)
             protein_props["pdb_ids"] = []
+            protein_props["pdb_entry_urls"] = []
+            protein_props["pdb_cif_urls"] = []
+            protein_props["pdb_pdb_urls"] = []
 
         # AlphaFold structure (from AlphaFold API)
         try:
             preds = self.alphafold.get_prediction(accession)
             protein_props["alphafold_entry_ids"] = [p.entryId for p in preds]
+            protein_props["alphafold_cif_urls"] = [p.cifUrl or "" for p in preds]
+            protein_props["alphafold_pdb_urls"] = [p.pdbUrl or "" for p in preds]
             best = self.alphafold.get_best_prediction(accession)
             if best:
                 protein_props["alphafold_cif_url"] = best.cifUrl or ""
@@ -205,6 +236,8 @@ class GraphExpansionPipeline:
         except Exception as exc:
             logger.warning("AlphaFold fetch failed for %s: %s", accession, exc)
             protein_props["alphafold_entry_ids"] = []
+            protein_props["alphafold_cif_urls"] = []
+            protein_props["alphafold_pdb_urls"] = []
             protein_props["alphafold_cif_url"] = ""
             protein_props["alphafold_pdb_url"] = ""
 
