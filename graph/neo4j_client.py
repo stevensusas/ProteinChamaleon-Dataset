@@ -284,6 +284,138 @@ class Neo4jClient:
             result = s.run("MATCH (p:Protein) RETURN p.accession AS acc")
             return [r["acc"] for r in result]
 
+    def get_protein_context(self, accession: str) -> dict[str, Any]:
+        """
+        Return one protein and its connected context:
+        - Protein node properties
+        - ProteinFeature nodes + HAS_FEATURE relationships
+        - GOTerm nodes + HAS_GO_ANNOTATION relationships
+        - PubMedArticle nodes + CITED_IN / EVIDENCED_BY relationships
+        """
+        with self.session() as s:
+            protein_row = s.run(
+                """
+                MATCH (p:Protein {accession: $acc})
+                RETURN properties(p) AS protein
+                """,
+                acc=accession,
+            ).single()
+
+            if not protein_row:
+                return {
+                    "protein": None,
+                    "features": [],
+                    "feature_relationships": [],
+                    "go_terms": [],
+                    "go_relationships": [],
+                    "articles": [],
+                    "article_relationships": {
+                        "cited_in": [],
+                        "feature_evidenced_by": [],
+                    },
+                }
+
+            feature_rows = s.run(
+                """
+                MATCH (p:Protein {accession: $acc})-[r:HAS_FEATURE]->(f:ProteinFeature)
+                RETURN properties(f) AS feature, properties(r) AS rel_props
+                """,
+                acc=accession,
+            )
+            features: list[dict[str, Any]] = []
+            feature_relationships: list[dict[str, Any]] = []
+            for row in feature_rows:
+                feature = row["feature"]
+                rel_props = row["rel_props"]
+                features.append(feature)
+                feature_relationships.append(
+                    {
+                        "protein_accession": accession,
+                        "feature_accession": feature.get("accession", ""),
+                        "properties": rel_props,
+                    }
+                )
+
+            go_rows = s.run(
+                """
+                MATCH (p:Protein {accession: $acc})-[r:HAS_GO_ANNOTATION]->(g:GOTerm)
+                RETURN properties(g) AS go_term, properties(r) AS rel_props
+                """,
+                acc=accession,
+            )
+            go_terms: list[dict[str, Any]] = []
+            go_relationships: list[dict[str, Any]] = []
+            for row in go_rows:
+                go_term = row["go_term"]
+                rel_props = row["rel_props"]
+                go_terms.append(go_term)
+                go_relationships.append(
+                    {
+                        "protein_accession": accession,
+                        "go_id": go_term.get("go_id", ""),
+                        "properties": rel_props,
+                    }
+                )
+
+            cited_rows = s.run(
+                """
+                MATCH (p:Protein {accession: $acc})-[r:CITED_IN]->(a:PubMedArticle)
+                RETURN properties(a) AS article, properties(r) AS rel_props
+                """,
+                acc=accession,
+            )
+            articles_by_pmid: dict[str, dict[str, Any]] = {}
+            cited_in_relationships: list[dict[str, Any]] = []
+            for row in cited_rows:
+                article = row["article"]
+                rel_props = row["rel_props"]
+                pmid = article.get("pmid", "")
+                if pmid:
+                    articles_by_pmid[pmid] = article
+                cited_in_relationships.append(
+                    {
+                        "protein_accession": accession,
+                        "pmid": pmid,
+                        "properties": rel_props,
+                    }
+                )
+
+            evidence_rows = s.run(
+                """
+                MATCH (p:Protein {accession: $acc})-[:HAS_FEATURE]->(f:ProteinFeature)-[r:EVIDENCED_BY]->(a:PubMedArticle)
+                RETURN properties(f) AS feature, properties(a) AS article, properties(r) AS rel_props
+                """,
+                acc=accession,
+            )
+            feature_evidence_relationships: list[dict[str, Any]] = []
+            for row in evidence_rows:
+                feature = row["feature"]
+                article = row["article"]
+                rel_props = row["rel_props"]
+                pmid = article.get("pmid", "")
+                if pmid:
+                    articles_by_pmid[pmid] = article
+                feature_evidence_relationships.append(
+                    {
+                        "feature_accession": feature.get("accession", ""),
+                        "pmid": pmid,
+                        "properties": rel_props,
+                    }
+                )
+
+            return {
+                "protein": protein_row["protein"],
+                "features": features,
+                "feature_relationships": feature_relationships,
+                "go_terms": go_terms,
+                "go_relationships": go_relationships,
+                "articles": list(articles_by_pmid.values()),
+                "article_relationships": {
+                    "cited_in": cited_in_relationships,
+                    "feature_evidenced_by": feature_evidence_relationships,
+                },
+            }
+
     def get_graph_stats(self) -> dict:
         """Return node and relationship counts per label/type."""
         with self.session() as s:

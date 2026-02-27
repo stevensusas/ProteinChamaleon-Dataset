@@ -13,7 +13,8 @@ Edge types written:   INTERACTS_WITH, HAS_GO_ANNOTATION, HAS_FEATURE
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import re
+from typing import Any, Optional
 
 from clients.uniprot import UniProtClient
 from clients.interpro import InterProClient
@@ -21,6 +22,7 @@ from clients.string_db import STRINGClient
 from clients.go_client import GOClient
 from clients.alphafold import AlphaFoldClient
 from clients.pdb import PDBClient
+from clients.pubmed import PubMedClient
 
 from .neo4j_client import Neo4jClient
 
@@ -40,6 +42,8 @@ class GraphExpansionPipeline:
       - Fetch STRING → write INTERACTS_WITH edges, enqueue partners
     """
 
+    _PMID_RE = re.compile(r"PMID[:\s]?(\d+)", re.IGNORECASE)
+
     def __init__(
         self,
         neo4j: Neo4jClient,
@@ -57,11 +61,13 @@ class GraphExpansionPipeline:
         self.go = GOClient()
         self.alphafold = AlphaFoldClient()
         self.pdb = PDBClient()
+        self.pubmed = PubMedClient()
+        self._pubmed_cache: dict[str, dict] = {}
 
     def close(self) -> None:
         for client in (
             self.uniprot, self.interpro, self.string_db,
-            self.go, self.alphafold, self.pdb,
+            self.go, self.alphafold, self.pdb, self.pubmed,
         ):
             client.close()
 
@@ -90,6 +96,75 @@ class GraphExpansionPipeline:
         return {"proteins_processed": len(seed_accessions)}
 
     # ── Per-protein processing ────────────────────────────────────────────────
+
+    def _extract_pmids(self, value: Any) -> set[str]:
+        """Recursively extract PMID values from strings / nested dicts / lists."""
+        pmids: set[str] = set()
+
+        def walk(v: Any) -> None:
+            if v is None:
+                return
+            if isinstance(v, str):
+                pmids.update(self._PMID_RE.findall(v))
+                return
+            if isinstance(v, dict):
+                for child in v.values():
+                    walk(child)
+                return
+            if isinstance(v, (list, tuple, set)):
+                for child in v:
+                    walk(child)
+
+        walk(value)
+        return pmids
+
+    def _ensure_pubmed_articles(self, s, pmids: set[str]) -> None:
+        """Ensure PubMedArticle nodes exist for PMID evidence."""
+        missing = [pmid for pmid in pmids if pmid not in self._pubmed_cache]
+        if missing:
+            try:
+                articles = self.pubmed.fetch_by_pmids(missing)
+                fetched = {a.pmid: a for a in articles}
+                for pmid in missing:
+                    article = fetched.get(pmid)
+                    if article:
+                        self._pubmed_cache[pmid] = {
+                            "pmid": article.pmid,
+                            "title": article.title or "",
+                            "journal": article.journal or "",
+                            "year": article.year or "",
+                            "doi": article.doi or "",
+                            "authors": article.author_names,
+                        }
+                    else:
+                        self._pubmed_cache[pmid] = {"pmid": pmid}
+            except Exception as exc:
+                logger.warning("PubMed fetch failed for %d PMID(s): %s", len(missing), exc)
+                for pmid in missing:
+                    self._pubmed_cache[pmid] = {"pmid": pmid}
+
+        for pmid in pmids:
+            self.neo4j.merge_pubmed_article(s, self._pubmed_cache[pmid])
+
+    def _link_go_evidence(self, s, protein_acc: str, reference: Optional[str]) -> None:
+        """Attach PubMed evidence for GO annotations via Protein -> CITED_IN."""
+        pmids = self._extract_pmids(reference)
+        if not pmids:
+            return
+        self._ensure_pubmed_articles(s, pmids)
+        for pmid in pmids:
+            self.neo4j.merge_cited_in(s, protein_acc, pmid)
+
+    def _link_feature_evidence(
+        self, s, protein_acc: str, feature_acc: str, evidence_blob: Any
+    ) -> None:
+        """Attach PubMed evidence for protein feature matches."""
+        pmids = self._extract_pmids(evidence_blob)
+        if not pmids:
+            return
+        self._ensure_pubmed_articles(s, pmids)
+        for pmid in pmids:
+            self.neo4j.merge_feature_evidence(s, protein_acc, feature_acc, pmid)
 
     def _write_protein_node(self, accession: str, entry) -> None:
         """Build full protein props (UniProt + PDB + AlphaFold), merge node, write InterPro and GO."""
@@ -197,6 +272,10 @@ class GraphExpansionPipeline:
                         self.neo4j.merge_has_feature(
                             s, accession, meta.accession, edge_props
                         )
+                # InterPro sometimes contains PMID references in nested metadata payloads.
+                self._link_feature_evidence(
+                    s, accession, meta.accession, match.model_dump()
+                )
 
     # ── GO annotations ────────────────────────────────────────────────────────
 
@@ -249,6 +328,7 @@ class GraphExpansionPipeline:
                     "is_experimental": ann.is_experimental,
                 }
                 self.neo4j.merge_go_annotation(s, accession, ann.goId, edge_props)
+                self._link_go_evidence(s, accession, ann.reference)
 
     # ── STRING PPI ────────────────────────────────────────────────────────────
 

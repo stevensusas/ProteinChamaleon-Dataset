@@ -235,9 +235,13 @@ class UniProtClient(BaseClient):
         if fields:
             params["fields"] = ",".join(fields)
 
-        url = f"{self.BASE_URL}/uniprotkb/search"
+        # Only send query params on the first request.
+        # UniProt pagination uses cursor-bearing `next` URLs in Link headers;
+        # re-sending base params on those URLs can reset pagination to page 1.
+        url: Optional[str] = f"{self.BASE_URL}/uniprotkb/search"
+        request_params: Optional[dict[str, Any]] = params
         while url:
-            resp = self._get(url, params=params)
+            resp = self._get(url, params=request_params)
             data = resp.json()
             for item in data.get("results", []):
                 yield UniProtEntry.model_validate(item)
@@ -246,11 +250,7 @@ class UniProtClient(BaseClient):
             if 'rel="next"' in link_header:
                 match = re.search(r"<([^>]+)>", link_header)
                 url = match.group(1) if match else None
-                # Keep query (and format/size) so the server receives required params on next request
-                if url:
-                    params = {"query": query, "format": "json", "size": size}
-                    if fields:
-                        params["fields"] = ",".join(fields)
+                request_params = None
             else:
                 url = None
 
