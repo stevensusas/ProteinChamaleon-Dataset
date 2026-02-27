@@ -38,3 +38,5 @@ def build_user_prompt(
         f"Structure file manifest:\n{structure_files}\n\n"
         f"Context JSON:\n{context}"
     )
+
+

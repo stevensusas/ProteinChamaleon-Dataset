@@ -1,8 +1,8 @@
-"""CLI demo for generating a protein description with the LLM client.
+"""CLI for generating a single-protein structure-interleaved description.
 
 Usage:
   source .env
-  python -m llm.demo --accession P04637
+  python -m llm.single_protein --accession P04637
 """
 
 from __future__ import annotations
@@ -192,7 +192,6 @@ def _slice_pdb_by_chain_ranges(
     if not chain_ranges:
         return False
 
-    # Merge ranges per chain to keep extraction efficient.
     by_chain: dict[str, list[tuple[int, int]]] = {}
     for chain_id, start, end in chain_ranges:
         if start <= 0 or end <= 0 or end < start:
@@ -225,22 +224,28 @@ def _slice_pdb_by_chain_ranges(
     return True
 
 
-def _prepare_structure_files(
+def prepare_structure_files(
     accession: str,
     protein: dict[str, Any],
     feature_rels: list[dict[str, Any]],
     structure_dir: Path,
     max_structures: int,
+    file_prefix: str = "",
+    output_subdir: str = "",
 ) -> list[dict[str, Any]]:
     manifest: list[dict[str, Any]] = []
     full_structure_files: list[Path] = []
     pdb_file_by_id: dict[str, Path] = {}
+    prefix = f"{_safe_name(file_prefix)}_" if file_prefix else ""
+    subdir = _safe_name(output_subdir) if output_subdir else ""
+    target_dir = structure_dir / subdir if subdir else structure_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
 
     pdb_ids = [str(x) for x in protein.get("pdb_ids", []) if x][:max_structures]
     for pdb_id in pdb_ids:
-        file_name = f"pdb_{_safe_name(pdb_id)}.pdb"
-        rel_path = f"structure/{file_name}"
-        out_path = structure_dir / file_name
+        file_name = f"{prefix}pdb_{_safe_name(pdb_id)}.pdb"
+        rel_path = f"structure/{subdir}/{file_name}" if subdir else f"structure/{file_name}"
+        out_path = target_dir / file_name
         url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
         if _download_file(url, out_path):
             full_structure_files.append(out_path)
@@ -262,9 +267,9 @@ def _prepare_structure_files(
         alphafold_urls = [str(protein["alphafold_pdb_url"])]
 
     for idx, url in enumerate(alphafold_urls, start=1):
-        file_name = f"alphafold_{idx}.pdb"
-        rel_path = f"structure/{file_name}"
-        out_path = structure_dir / file_name
+        file_name = f"{prefix}alphafold_{idx}.pdb"
+        rel_path = f"structure/{subdir}/{file_name}" if subdir else f"structure/{file_name}"
+        out_path = target_dir / file_name
         if _download_file(url, out_path):
             full_structure_files.append(out_path)
             manifest.append(
@@ -277,7 +282,6 @@ def _prepare_structure_files(
                 }
             )
 
-    # Use first available full structure as reference for feature slicing.
     reference_structure = full_structure_files[0] if full_structure_files else None
     if reference_structure is None:
         return manifest
@@ -291,7 +295,6 @@ def _prepare_structure_files(
         if not feat_acc or not isinstance(start, int) or not isinstance(end, int):
             continue
 
-        # Try mapped chain-aware slicing from downloaded PDB files first.
         wrote_mapped_slice = False
         for pdb_id, pdb_path in pdb_file_by_id.items():
             if pdb_id not in mapping_cache:
@@ -304,11 +307,11 @@ def _prepare_structure_files(
 
             chain_tag = "_".join(sorted({cr[0] for cr in chain_ranges}))
             file_name = (
-                f"feature_{_safe_name(feat_acc)}_{start}_{end}_"
+                f"{prefix}feature_{_safe_name(feat_acc)}_{start}_{end}_"
                 f"pdb_{_safe_name(pdb_id)}_chain_{_safe_name(chain_tag)}.pdb"
             )
-            rel_path = f"structure/{file_name}"
-            out_path = structure_dir / file_name
+            rel_path = f"structure/{subdir}/{file_name}" if subdir else f"structure/{file_name}"
+            out_path = target_dir / file_name
             if not _slice_pdb_by_chain_ranges(pdb_path, out_path, chain_ranges):
                 continue
             manifest.append(
@@ -335,10 +338,9 @@ def _prepare_structure_files(
         if wrote_mapped_slice:
             continue
 
-        # Fallback to naive numbering on the first structure if mapping unavailable.
-        file_name = f"feature_{_safe_name(feat_acc)}_{start}_{end}.pdb"
-        rel_path = f"structure/{file_name}"
-        out_path = structure_dir / file_name
+        file_name = f"{prefix}feature_{_safe_name(feat_acc)}_{start}_{end}.pdb"
+        rel_path = f"structure/{subdir}/{file_name}" if subdir else f"structure/{file_name}"
+        out_path = target_dir / file_name
         if _slice_pdb_by_residue_range(reference_structure, out_path, start, end):
             manifest.append(
                 {
@@ -367,7 +369,7 @@ def main() -> None:
     config = LLMConfig.from_env()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     root_output_dir = Path(__file__).resolve().parent.parent / "output"
-    run_dir = root_output_dir / f"{args.accession}_{timestamp}"
+    run_dir = root_output_dir / f"{args.accession}_{timestamp}_single"
     structure_dir = run_dir / "structure"
     structure_dir.mkdir(parents=True, exist_ok=True)
 
@@ -377,7 +379,7 @@ def main() -> None:
         if not protein:
             raise ValueError(f"Protein not found in graph: {args.accession}")
 
-        structure_manifest = _prepare_structure_files(
+        structure_manifest = prepare_structure_files(
             accession=args.accession,
             protein=protein,
             feature_rels=context.get("feature_relationships", []),

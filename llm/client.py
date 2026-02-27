@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 
 from graph.neo4j_client import Neo4jClient
-from llm.prompts import SYSTEM_PROMPT, build_user_prompt
+from llm.prompts import SYSTEM_PROMPT, build_multi_protein_prompt, build_user_prompt
 
 
 @dataclass
@@ -126,6 +126,55 @@ class ProteinDescriptionLLMClient:
             },
         ]
 
+    def _context_for_network_prompt(
+        self,
+        contexts: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """
+        Build a multi-protein prompt context that preserves all graph objects
+        (protein, features, GO terms, relationships, and articles) while
+        truncating very large article full-text fields for token safety.
+        """
+        packed: dict[str, Any] = {}
+        for acc, ctx in contexts.items():
+            articles = ctx.get("articles", []) or []
+            packed_articles: list[dict[str, Any]] = []
+            for article in articles:
+                if not isinstance(article, dict):
+                    continue
+                art = dict(article)
+                full_text = art.get("full_text")
+                if isinstance(full_text, str):
+                    art["full_text_excerpt"] = full_text[:1200]
+                    art["full_text_char_count"] = len(full_text)
+                    art.pop("full_text", None)
+                packed_articles.append(art)
+
+            packed[acc] = {
+                "protein": ctx.get("protein"),
+                "features": ctx.get("features", []),
+                "feature_relationships": ctx.get("feature_relationships", []),
+                "go_terms": ctx.get("go_terms", []),
+                "go_relationships": ctx.get("go_relationships", []),
+                "articles": packed_articles,
+                "article_relationships": ctx.get("article_relationships", {}),
+            }
+        return packed
+
+    def _chat(self, messages: list[dict[str, str]]) -> str:
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+        }
+        resp = self.session.post(
+            f"{self.config.base_url.rstrip('/')}/chat/completions", json=payload
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+
     def describe_protein(
         self,
         accession: str,
@@ -135,17 +184,28 @@ class ProteinDescriptionLLMClient:
         context = self.neo4j.get_protein_context(accession)
         if not context.get("protein"):
             raise ValueError(f"Protein not found in graph: {accession}")
+        messages = self._build_messages(accession, context, structure_files=structure_files)
+        return self._chat(messages)
 
-        payload = {
-            "model": self.config.model,
-            "messages": self._build_messages(
-                accession, context, structure_files=structure_files
-            ),
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
-        }
-
-        resp = self.session.post(f"{self.config.base_url.rstrip('/')}/chat/completions", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+    def describe_protein_network(
+        self,
+        accessions: list[str],
+        contexts: dict[str, dict[str, Any]],
+        interaction_edges: list[dict[str, Any]],
+        structure_manifest: list[dict[str, Any]],
+    ) -> str:
+        """Generate a concise network narrative for multiple interacting proteins."""
+        packed_contexts = self._context_for_network_prompt(contexts)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": build_multi_protein_prompt(
+                    accessions=accessions,
+                    contexts=packed_contexts,
+                    interaction_edges=interaction_edges,
+                    structure_manifest=structure_manifest,
+                ),
+            },
+        ]
+        return self._chat(messages)
