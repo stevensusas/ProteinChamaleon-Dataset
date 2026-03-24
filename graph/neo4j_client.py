@@ -416,16 +416,10 @@ class Neo4jClient:
                 },
             }
 
-    def get_graph_stats(self) -> dict:
-        """Return node and relationship counts per label/type."""
+    def get_counts(self) -> dict[str, int]:
+        """Return node and relationship counts per label/type (no APOC needed)."""
         with self.session() as s:
-            nodes = dict(s.run(
-                """
-                CALL apoc.meta.stats() YIELD labels
-                RETURN labels
-                """
-            ).single() or {})
-            counts = s.run(
+            rows = s.run(
                 """
                 CALL {
                   MATCH (n) RETURN labels(n)[0] AS label, count(n) AS cnt
@@ -435,7 +429,11 @@ class Neo4jClient:
                 RETURN label, cnt ORDER BY cnt DESC
                 """
             )
-            return {r["label"]: r["cnt"] for r in counts}
+            return {r["label"]: r["cnt"] for r in rows}
+
+    def get_graph_stats(self) -> dict:
+        """Alias for get_counts() (backward compat)."""
+        return self.get_counts()
 
     def get_protein_neighbors(
         self, accession: str, max_hops: int = 1

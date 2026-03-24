@@ -4,7 +4,13 @@ Graph expansion pipeline for the ProteinChameleon knowledge graph.
 Starting from a set of seed proteins, the pipeline:
   1. Fetches full annotations for each protein from all 8 APIs
   2. Writes nodes and edges to Neo4j
-  3. Discovers interaction partners (STRING) and recurse (BFS, depth-limited)
+  3. Discovers interaction partners (STRING) and enqueues them for BFS expansion
+
+The graph grows outward from seeds until no new partners are found above the
+score threshold, or an optional protein cap is reached.
+
+When workers > 1 the BFS is executed by a thread pool so multiple proteins
+are annotated and written concurrently.
 
 Node types written:   Protein, ProteinFeature, GOTerm
 Edge types written:   INTERACTS_WITH, HAS_GO_ANNOTATION, HAS_FEATURE
@@ -12,8 +18,14 @@ Edge types written:   INTERACTS_WITH, HAS_GO_ANNOTATION, HAS_FEATURE
 
 from __future__ import annotations
 
+import json
 import logging
+import queue
 import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Optional
 
 from clients.uniprot import UniProtClient
@@ -28,18 +40,31 @@ from .neo4j_client import Neo4jClient
 
 logger = logging.getLogger(__name__)
 
+# Per-API concurrency caps (semaphore values).
+_API_CONCURRENCY = {
+    "uniprot": 3,
+    "interpro": 2,
+    "string": 1,
+    "go": 2,
+    "alphafold": 2,
+    "pdb": 3,
+    "pubmed": 3,
+}
+
 
 class GraphExpansionPipeline:
     """
-    Process seed protein(s) and up to N interaction partners (filled on the spot).
+    Multithreaded BFS graph expansion from seed proteins.
 
-    For each seed:
-      - Fetch UniProt → write Protein node (core fields only)
-      - Fetch PDB → add pdb_ids to Protein (from PDB Search API)
-      - Fetch AlphaFold → add alphafold_entry_ids, alphafold_cif_url, alphafold_pdb_url to Protein
+    For each protein (seed or discovered partner):
+      - Fetch UniProt → write Protein node
+      - Fetch PDB → add pdb_ids to Protein
+      - Fetch AlphaFold → add alphafold structure links
       - Fetch InterPro → write ProteinFeature nodes + HAS_FEATURE edges
       - Fetch GO (QuickGO) → write GOTerm nodes + HAS_GO_ANNOTATION edges
-      - Fetch STRING → write INTERACTS_WITH edges, enqueue partners
+      - Fetch STRING → write INTERACTS_WITH edges, enqueue unseen partners
+
+    Expansion continues until the BFS queue is exhausted or max_proteins is hit.
     """
 
     _PMID_RE = re.compile(r"PMID[:\s]?(\d+)", re.IGNORECASE)
@@ -49,21 +74,25 @@ class GraphExpansionPipeline:
         self,
         neo4j: Neo4jClient,
         string_score_threshold: int = 700,
-        max_partners_per_protein: int = 5,
+        max_proteins: Optional[int] = None,
+        workers: int = 6,
     ) -> None:
         self.neo4j = neo4j
         self.string_score_threshold = string_score_threshold
-        self.max_partners = max_partners_per_protein
+        self.max_proteins = max_proteins
+        self.workers = max(1, workers)
 
-        # Initialise API clients
-        self.uniprot = UniProtClient()
-        self.interpro = InterProClient()
-        self.string_db = STRINGClient()
-        self.go = GOClient()
-        self.alphafold = AlphaFoldClient()
-        self.pdb = PDBClient()
-        self.pubmed = PubMedClient()
+        # Initialise API clients with per-API concurrency semaphores
+        self.uniprot = UniProtClient(max_concurrency=_API_CONCURRENCY["uniprot"])
+        self.interpro = InterProClient(max_concurrency=_API_CONCURRENCY["interpro"])
+        self.string_db = STRINGClient(max_concurrency=_API_CONCURRENCY["string"])
+        self.go = GOClient(max_concurrency=_API_CONCURRENCY["go"])
+        self.alphafold = AlphaFoldClient(max_concurrency=_API_CONCURRENCY["alphafold"])
+        self.pdb = PDBClient(max_concurrency=_API_CONCURRENCY["pdb"])
+        self.pubmed = PubMedClient(max_concurrency=_API_CONCURRENCY["pubmed"])
+
         self._pubmed_cache: dict[str, dict] = {}
+        self._pubmed_lock = threading.Lock()
 
     def close(self) -> None:
         for client in (
@@ -80,21 +109,193 @@ class GraphExpansionPipeline:
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
-    def run(self, seed_accessions: list[str]) -> dict[str, int]:
+    def run(
+        self,
+        seed_accessions: list[str],
+        clear: bool = True,
+        output_dir: Optional[str | Path] = None,
+    ) -> dict[str, int]:
         """
-        Process each seed protein and up to max_partners_per_protein interaction
-        partners. Partners are filled on the spot (no BFS).
-        Clears the graph before each run.
+        Multithreaded BFS expansion from seed proteins.
+
+        Workers pull accessions from a shared queue, process them (API calls +
+        Neo4j writes), and push newly discovered partners back onto the queue.
+        Continues until the queue is drained or max_proteins is reached.
+
+        Args:
+            seed_accessions: Starting UniProt accessions.
+            clear: Wipe the graph before this run (default True).
+            output_dir: If given, save growth_log.json and growth_chart.png here.
         """
-        self.neo4j.clear_graph()
+        if clear:
+            self.neo4j.clear_graph()
         self.neo4j.setup_schema()
 
-        for i, accession in enumerate(seed_accessions):
-            logger.info("Processing seed %s (%d/%d)", accession, i + 1, len(seed_accessions))
-            self._process_protein(accession)
+        bfs_queue: queue.Queue[str] = queue.Queue()
+        visited: set[str] = set()
+        visited_lock = threading.Lock()
+        processed_count = 0
+        processed_lock = threading.Lock()
+        cap_reached = threading.Event()
 
-        logger.info("Pipeline complete. Processed %d seed(s).", len(seed_accessions))
-        return {"proteins_processed": len(seed_accessions)}
+        t0 = time.monotonic()
+        snapshot_file = None
+        snapshot_file_lock = threading.Lock()
+
+        for acc in seed_accessions:
+            if acc not in visited:
+                visited.add(acc)
+                bfs_queue.put(acc)
+
+        def _worker() -> None:
+            nonlocal processed_count
+            while not cap_reached.is_set():
+                try:
+                    accession = bfs_queue.get(timeout=3)
+                except queue.Empty:
+                    return
+
+                with processed_lock:
+                    if self.max_proteins is not None and processed_count >= self.max_proteins:
+                        bfs_queue.task_done()
+                        cap_reached.set()
+                        return
+                    processed_count += 1
+                    seq = processed_count
+
+                logger.info(
+                    "Processing %s (#%d, ~%d queued)",
+                    accession, seq, bfs_queue.qsize(),
+                )
+
+                try:
+                    new_partners = self._process_protein(accession)
+                except Exception:
+                    logger.exception("Unhandled error processing %s", accession)
+                    new_partners = []
+
+                with visited_lock:
+                    for partner_acc in new_partners:
+                        if partner_acc not in visited:
+                            visited.add(partner_acc)
+                            bfs_queue.put(partner_acc)
+
+                try:
+                    counts = self.neo4j.get_counts()
+                    snap = {"seq": seq, "accession": accession, "elapsed_s": round(time.monotonic() - t0, 1)}
+                    snap.update(counts)
+                    if snapshot_file is not None:
+                        with snapshot_file_lock:
+                            snapshot_file.write(json.dumps(snap) + "\n")
+                            snapshot_file.flush()
+                except Exception:
+                    pass
+
+                bfs_queue.task_done()
+
+        try:
+            if output_dir is not None:
+                out_path = Path(output_dir)
+                out_path.mkdir(parents=True, exist_ok=True)
+                snapshot_file = open(out_path / "growth_log.jsonl", "a", encoding="utf-8")
+
+            with ThreadPoolExecutor(
+                max_workers=self.workers, thread_name_prefix="bfs"
+            ) as pool:
+                futures = [pool.submit(_worker) for _ in range(self.workers)]
+                try:
+                    bfs_queue.join()
+                except KeyboardInterrupt:
+                    logger.info("Interrupted — stopping workers and saving progress...")
+                finally:
+                    cap_reached.set()
+                for f in futures:
+                    try:
+                        f.result()
+                    except Exception:
+                        pass
+        finally:
+            if snapshot_file is not None and not snapshot_file.closed:
+                snapshot_file.close()
+            if output_dir is not None:
+                self._save_growth_chart(Path(output_dir))
+
+        logger.info(
+            "Pipeline complete. Processed %d protein(s), %d discovered total.",
+            processed_count, len(visited),
+        )
+
+        return {"proteins_processed": processed_count, "proteins_discovered": len(visited)}
+
+    # ── Growth chart ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _save_growth_chart(output_dir: Path) -> None:
+        """Read incremental growth_log.jsonl and generate growth_chart.png."""
+        jsonl_path = output_dir / "growth_log.jsonl"
+        if not jsonl_path.exists():
+            logger.warning("No growth_log.jsonl found in %s", output_dir)
+            return
+
+        snapshots: list[dict[str, Any]] = []
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    snapshots.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+        if not snapshots:
+            return
+
+        snapshots.sort(key=lambda s: s["seq"])
+
+        json_path = output_dir / "growth_log.json"
+        json_path.write_text(json.dumps(snapshots, indent=2), encoding="utf-8")
+        logger.info("Saved growth log (%d snapshots) to %s", len(snapshots), json_path)
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logger.warning("matplotlib not installed — skipping growth chart.")
+            return
+
+        node_labels = ["Protein", "ProteinFeature", "GOTerm", "PubMedArticle"]
+        edge_labels = ["INTERACTS_WITH", "HAS_FEATURE", "HAS_GO_ANNOTATION", "CITED_IN"]
+
+        x = [s["elapsed_s"] for s in snapshots]
+
+        fig, (ax_nodes, ax_edges) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+        for label in node_labels:
+            y = [s.get(label, 0) for s in snapshots]
+            ax_nodes.plot(x, y, marker="o", markersize=3, label=label)
+        ax_nodes.set_ylabel("Node count")
+        ax_nodes.set_title("Graph Growth Over Time")
+        ax_nodes.legend(loc="upper left")
+        ax_nodes.grid(True, alpha=0.3)
+
+        for label in edge_labels:
+            y = [s.get(label, 0) for s in snapshots]
+            ax_edges.plot(x, y, marker="o", markersize=3, label=label)
+        ax_edges.set_ylabel("Edge count")
+        ax_edges.set_xlabel("Elapsed time (seconds)")
+        ax_edges.legend(loc="upper left")
+        ax_edges.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        chart_path = output_dir / "growth_chart.png"
+        fig.savefig(chart_path, dpi=150)
+        plt.close(fig)
+        logger.info("Saved growth chart to %s", chart_path)
+
+    @classmethod
+    def generate_chart(cls, output_dir: str | Path) -> None:
+        """Standalone: regenerate chart from an existing growth_log.jsonl."""
+        cls._save_growth_chart(Path(output_dir))
 
     # ── Per-protein processing ────────────────────────────────────────────────
 
@@ -121,46 +322,55 @@ class GraphExpansionPipeline:
 
     def _ensure_pubmed_articles(self, s, pmids: set[str]) -> None:
         """Ensure PubMedArticle nodes exist for PMID evidence."""
-        missing = [pmid for pmid in pmids if pmid not in self._pubmed_cache]
+        with self._pubmed_lock:
+            missing = [pmid for pmid in pmids if pmid not in self._pubmed_cache]
+
         if missing:
             try:
                 articles = self.pubmed.fetch_by_pmids(missing)
                 fetched = {a.pmid: a for a in articles}
-                for pmid in missing:
-                    article = fetched.get(pmid)
-                    if article:
-                        full_text = ""
-                        if article.pmc:
-                            pmc_text = self.pubmed.fetch_pmc_full_text(article.pmc)
-                            if pmc_text:
-                                full_text = pmc_text[: self._PMC_FULL_TEXT_MAX_CHARS]
-                        self._pubmed_cache[pmid] = {
-                            "pmid": article.pmid,
-                            "title": article.title or "",
-                            "abstract": article.abstract or "",
-                            "journal": article.journal or "",
-                            "journal_abbrev": article.journal_abbrev or "",
-                            "year": article.year or "",
-                            "volume": article.volume or "",
-                            "issue": article.issue or "",
-                            "pages": article.pages or "",
-                            "doi": article.doi or "",
-                            "pmc": article.pmc or "",
-                            "pubmed_url": article.pubmed_url,
-                            "authors": article.author_names,
-                            "mesh_terms": article.mesh_terms,
-                            "publication_types": article.publication_types,
-                            "full_text": full_text,
-                        }
-                    else:
-                        self._pubmed_cache[pmid] = {"pmid": pmid}
+                with self._pubmed_lock:
+                    for pmid in missing:
+                        if pmid in self._pubmed_cache:
+                            continue
+                        article = fetched.get(pmid)
+                        if article:
+                            full_text = ""
+                            if article.pmc:
+                                pmc_text = self.pubmed.fetch_pmc_full_text(article.pmc)
+                                if pmc_text:
+                                    full_text = pmc_text[: self._PMC_FULL_TEXT_MAX_CHARS]
+                            self._pubmed_cache[pmid] = {
+                                "pmid": article.pmid,
+                                "title": article.title or "",
+                                "abstract": article.abstract or "",
+                                "journal": article.journal or "",
+                                "journal_abbrev": article.journal_abbrev or "",
+                                "year": article.year or "",
+                                "volume": article.volume or "",
+                                "issue": article.issue or "",
+                                "pages": article.pages or "",
+                                "doi": article.doi or "",
+                                "pmc": article.pmc or "",
+                                "pubmed_url": article.pubmed_url,
+                                "authors": article.author_names,
+                                "mesh_terms": article.mesh_terms,
+                                "publication_types": article.publication_types,
+                                "full_text": full_text,
+                            }
+                        else:
+                            self._pubmed_cache[pmid] = {"pmid": pmid}
             except Exception as exc:
                 logger.warning("PubMed fetch failed for %d PMID(s): %s", len(missing), exc)
-                for pmid in missing:
-                    self._pubmed_cache[pmid] = {"pmid": pmid}
+                with self._pubmed_lock:
+                    for pmid in missing:
+                        if pmid not in self._pubmed_cache:
+                            self._pubmed_cache[pmid] = {"pmid": pmid}
 
-        for pmid in pmids:
-            self.neo4j.merge_pubmed_article(s, self._pubmed_cache[pmid])
+        with self._pubmed_lock:
+            cached = {pmid: self._pubmed_cache[pmid] for pmid in pmids if pmid in self._pubmed_cache}
+        for pmid, props in cached.items():
+            self.neo4j.merge_pubmed_article(s, props)
 
     def _link_go_evidence(self, s, protein_acc: str, reference: Optional[str]) -> None:
         """Attach PubMed evidence for GO annotations via Protein -> CITED_IN."""
@@ -247,25 +457,19 @@ class GraphExpansionPipeline:
         self._write_interpro(accession)
         self._write_go_annotations(accession)
 
-    def _fill_protein(self, accession: str) -> None:
-        """Fetch UniProt entry and write full protein node (for partners)."""
+    def _process_protein(self, accession: str) -> list[str]:
+        """
+        Fetch all data for one protein, write to Neo4j, discover STRING
+        partners, and return their accessions for BFS enqueuing.
+        """
         try:
             entry = self.uniprot.get_entry(accession)
         except Exception as exc:
             logger.warning("UniProt fetch failed for %s: %s", accession, exc)
-            return
-        self._write_protein_node(accession, entry)
-
-    def _process_protein(self, accession: str) -> None:
-        """Fetch all data for one protein, write to Neo4j, then fetch and fill up to max_partners interaction partners on the spot."""
-        try:
-            entry = self.uniprot.get_entry(accession)
-        except Exception as exc:
-            logger.warning("UniProt fetch failed for %s: %s", accession, exc)
-            return
+            return []
 
         self._write_protein_node(accession, entry)
-        self._write_ppi(accession, entry)
+        return self._write_ppi(accession, entry)
 
     # ── InterPro ──────────────────────────────────────────────────────────────
 
@@ -365,51 +569,54 @@ class GraphExpansionPipeline:
 
     # ── STRING PPI ────────────────────────────────────────────────────────────
 
-    def _write_ppi(self, accession: str, entry) -> None:
+    def _write_ppi(self, accession: str, entry) -> list[str]:
         """
-        Fetch up to max_partners interaction partners, fill each on the spot (full node),
-        then write INTERACTS_WITH edges.
+        Fetch all STRING interaction partners above the score threshold,
+        write placeholder Protein nodes and INTERACTS_WITH edges, and return
+        the partner accessions so the BFS caller can enqueue them.
         """
         string_id = entry.get_string_id()
         if not string_id:
             logger.debug("No STRING ID for %s, skipping PPI", accession)
-            return
+            return []
 
         try:
             interactions = self.string_db.get_interaction_partners(
                 [string_id],
                 taxon=entry.organism.taxonId,
                 required_score=self.string_score_threshold,
-                limit=self.max_partners,
             )
         except Exception as exc:
             logger.warning("STRING fetch failed for %s: %s", accession, exc)
-            return
+            return []
 
+        discovered: list[str] = []
         with self.neo4j.session() as s:
             for iact in interactions:
-                partner_name = iact.preferredName_B
-                partner_string_id = iact.stringId_B
-
                 partner_acc = self._resolve_string_to_uniprot(
-                    partner_string_id, partner_name, entry.organism.taxonId
+                    iact.stringId_B, iact.preferredName_B, entry.organism.taxonId
                 )
+                if not partner_acc:
+                    continue
 
-                if partner_acc:
-                    self._fill_protein(partner_acc)
+                self.neo4j.merge_protein(s, {"accession": partner_acc})
 
-                    edge_props = {
-                        "score": iact.score,
-                        "confidence": iact.confidence,
-                        "escore": iact.escore,
-                        "dscore": iact.dscore,
-                        "tscore": iact.tscore,
-                        "nscore": iact.nscore,
-                        "ascore": iact.ascore,
-                        "fscore": iact.fscore,
-                        "dominant_source": iact.dominant_source,
-                    }
-                    self.neo4j.merge_ppi(s, accession, partner_acc, edge_props)
+                edge_props = {
+                    "score": iact.score,
+                    "confidence": iact.confidence,
+                    "escore": iact.escore,
+                    "dscore": iact.dscore,
+                    "tscore": iact.tscore,
+                    "nscore": iact.nscore,
+                    "ascore": iact.ascore,
+                    "fscore": iact.fscore,
+                    "dominant_source": iact.dominant_source,
+                }
+                self.neo4j.merge_ppi(s, accession, partner_acc, edge_props)
+                discovered.append(partner_acc)
+
+        logger.info("STRING: %s -> %d partner(s) discovered", accession, len(discovered))
+        return discovered
 
     def _resolve_string_to_uniprot(
         self, string_id: str, gene_name: str, taxon_id: int

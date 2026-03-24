@@ -172,10 +172,11 @@ class PubMedClient(BaseClient):
         api_key: Optional[str] = None,
         email: Optional[str] = "research@example.com",
         tool: str = "ProteinChameleonDataset",
+        max_concurrency: int | None = None,
     ) -> None:
         # Respect NCBI rate limits: 3 req/s without key, 10 req/s with key
         delay = 0.11 if api_key else 0.35
-        super().__init__(self.BASE_URL, rate_limit_delay=delay)
+        super().__init__(self.BASE_URL, rate_limit_delay=delay, max_concurrency=max_concurrency)
         self.api_key = api_key
         self.email = email
         self.tool = tool

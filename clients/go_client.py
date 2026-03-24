@@ -145,8 +145,8 @@ class GOClient(BaseClient):
 
     BASE_URL = "https://www.ebi.ac.uk/QuickGO/services"
 
-    def __init__(self, rate_limit_delay: float = 0.12) -> None:
-        super().__init__(self.BASE_URL, rate_limit_delay=rate_limit_delay)
+    def __init__(self, rate_limit_delay: float = 0.12, max_concurrency: int | None = None) -> None:
+        super().__init__(self.BASE_URL, rate_limit_delay=rate_limit_delay, max_concurrency=max_concurrency)
         self.session.headers.update({"Accept": "application/json"})
 
     def _paginate_annotations(self, params: dict) -> Generator[GOAnnotation, None, None]:

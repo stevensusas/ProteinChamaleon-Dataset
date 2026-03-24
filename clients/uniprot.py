@@ -197,8 +197,8 @@ class UniProtClient(BaseClient):
 
     BASE_URL = "https://rest.uniprot.org"
 
-    def __init__(self, rate_limit_delay: float = 0.5) -> None:
-        super().__init__(self.BASE_URL, rate_limit_delay=rate_limit_delay)
+    def __init__(self, rate_limit_delay: float = 0.5, max_concurrency: int | None = None) -> None:
+        super().__init__(self.BASE_URL, rate_limit_delay=rate_limit_delay, max_concurrency=max_concurrency)
 
     def get_entry(self, accession: str) -> UniProtEntry:
         """Fetch a single UniProtKB entry by accession (e.g., 'P69905')."""

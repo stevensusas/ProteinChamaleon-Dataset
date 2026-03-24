@@ -64,8 +64,8 @@ class AlphaFoldClient(BaseClient):
     API_URL = "https://alphafold.ebi.ac.uk/api"
     FILES_URL = "https://alphafold.ebi.ac.uk/files"
 
-    def __init__(self, rate_limit_delay: float = 0.15) -> None:
-        super().__init__(self.API_URL, rate_limit_delay=rate_limit_delay)
+    def __init__(self, rate_limit_delay: float = 0.15, max_concurrency: int | None = None) -> None:
+        super().__init__(self.API_URL, rate_limit_delay=rate_limit_delay, max_concurrency=max_concurrency)
 
     def get_prediction(self, uniprot_acc: str) -> list[AlphaFoldPrediction]:
         """

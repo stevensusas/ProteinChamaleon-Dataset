@@ -11,5 +11,8 @@ neo4j>=5.0.0
 pytest>=7.0.0
 pytest-asyncio>=0.21.0
 
+# Charting (growth visualization)
+matplotlib>=3.7.0
+
 # Optional: progress bars for demo
 tqdm>=4.66.0

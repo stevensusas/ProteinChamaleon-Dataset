@@ -93,8 +93,9 @@ class STRINGClient(BaseClient):
         self,
         rate_limit_delay: float = 1.0,
         caller_identity: Optional[str] = None,
+        max_concurrency: int | None = None,
     ) -> None:
-        super().__init__(self.BASE_URL, rate_limit_delay=rate_limit_delay)
+        super().__init__(self.BASE_URL, rate_limit_delay=rate_limit_delay, max_concurrency=max_concurrency)
         self.caller_identity = caller_identity or self.DEFAULT_CALLER
 
     def _params(self, **extra) -> dict:
