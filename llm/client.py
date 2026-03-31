@@ -78,34 +78,24 @@ class ProteinDescriptionLLMClient:
 
     def _context_for_prompt(self, context: dict[str, Any]) -> dict[str, Any]:
         """
-        Keep prompt compact by sampling large collections.
-        The full graph context can be very large for proteins like TP53.
+        Build a prompt-ready context with protein identity, structural features,
+        and GO terms. Articles are excluded to keep prompts compact.
         """
         features = context.get("features", [])
         feature_rels = context.get("feature_relationships", [])
         go_terms = context.get("go_terms", [])
         go_rels = context.get("go_relationships", [])
-        articles = context.get("articles", [])
-        article_rels = context.get("article_relationships", {})
 
         return {
             "protein": context.get("protein"),
             "counts": {
                 "features": len(features),
                 "go_terms": len(go_terms),
-                "articles": len(articles),
-                "cited_in_edges": len(article_rels.get("cited_in", [])),
-                "feature_evidenced_by_edges": len(article_rels.get("feature_evidenced_by", [])),
             },
-            "features_sample": features[:20],
-            "feature_relationships_sample": feature_rels[:30],
+            "features": features,
+            "feature_relationships": feature_rels,
             "go_terms_sample": go_terms[:30],
             "go_relationships_sample": go_rels[:40],
-            "articles_sample": articles[:25],
-            "article_relationships_sample": {
-                "cited_in": article_rels.get("cited_in", [])[:40],
-                "feature_evidenced_by": article_rels.get("feature_evidenced_by", [])[:40],
-            },
         }
 
     def _build_messages(
@@ -131,35 +121,23 @@ class ProteinDescriptionLLMClient:
         contexts: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
         """
-        Build a multi-protein prompt context that preserves all graph objects
-        (protein, features, GO terms, relationships, and articles) while
-        truncating very large article full-text fields for token safety.
+        Build a multi-protein prompt context focused on protein identity,
+        function, and structural features. GO terms and articles are excluded.
         """
-        packed: dict[str, Any] = {}
-        for acc, ctx in contexts.items():
-            articles = ctx.get("articles", []) or []
-            packed_articles: list[dict[str, Any]] = []
-            for article in articles:
-                if not isinstance(article, dict):
-                    continue
-                art = dict(article)
-                full_text = art.get("full_text")
-                if isinstance(full_text, str):
-                    art["full_text_excerpt"] = full_text[:1200]
-                    art["full_text_char_count"] = len(full_text)
-                    art.pop("full_text", None)
-                packed_articles.append(art)
-
-            packed[acc] = {
+        return {
+            acc: {
                 "protein": ctx.get("protein"),
+                "counts": {
+                    "features": len(ctx.get("features", [])),
+                    "go_terms": len(ctx.get("go_terms", [])),
+                },
                 "features": ctx.get("features", []),
                 "feature_relationships": ctx.get("feature_relationships", []),
-                "go_terms": ctx.get("go_terms", []),
-                "go_relationships": ctx.get("go_relationships", []),
-                "articles": packed_articles,
-                "article_relationships": ctx.get("article_relationships", {}),
+                "go_terms_sample": ctx.get("go_terms", [])[:30],
+                "go_relationships_sample": ctx.get("go_relationships", [])[:40],
             }
-        return packed
+            for acc, ctx in contexts.items()
+        }
 
     def _chat(self, messages: list[dict[str, str]]) -> str:
         payload = {
