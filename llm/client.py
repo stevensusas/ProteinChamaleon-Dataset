@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import re
 from typing import Any
 
 import httpx
@@ -76,36 +77,38 @@ class ProteinDescriptionLLMClient:
     def __exit__(self, *args: Any) -> None:
         self.close()
 
+    _STRIP_FIELDS = frozenset({
+        # bulk URL lists
+        "pdb_pdb_urls", "pdb_cif_urls", "pdb_entry_urls",
+        "alphafold_pdb_urls", "alphafold_cif_urls",
+        "alphafold_cif_url", "alphafold_pdb_url",
+        # low-value metadata
+        "string_id", "ec_numbers", "is_reviewed", "taxon_id",
+    })
+
+    _PUBMED_RE = re.compile(r"\s*\(PubMed:[^)]+\)")
+
+    def _trim_protein(self, protein: dict[str, Any]) -> dict[str, Any]:
+        """Strip URL fields, low-value metadata, and PubMed citations from function_text."""
+        result = {k: v for k, v in protein.items() if k not in self._STRIP_FIELDS}
+        if isinstance(result.get("function_text"), str):
+            result["function_text"] = self._PUBMED_RE.sub("", result["function_text"]).strip()
+        return result
+
     def _context_for_prompt(self, context: dict[str, Any]) -> dict[str, Any]:
         """
-        Keep prompt compact by sampling large collections.
-        The full graph context can be very large for proteins like TP53.
+        Compact context: protein identity + structural features only.
+        URL fields, GO terms, and articles are excluded to keep prompts lean.
         """
         features = context.get("features", [])
         feature_rels = context.get("feature_relationships", [])
-        go_terms = context.get("go_terms", [])
-        go_rels = context.get("go_relationships", [])
-        articles = context.get("articles", [])
-        article_rels = context.get("article_relationships", {})
+        protein = context.get("protein") or {}
 
         return {
-            "protein": context.get("protein"),
-            "counts": {
-                "features": len(features),
-                "go_terms": len(go_terms),
-                "articles": len(articles),
-                "cited_in_edges": len(article_rels.get("cited_in", [])),
-                "feature_evidenced_by_edges": len(article_rels.get("feature_evidenced_by", [])),
-            },
+            "protein": self._trim_protein(protein),
+            "counts": {"features": len(features)},
             "features_sample": features[:20],
             "feature_relationships_sample": feature_rels[:30],
-            "go_terms_sample": go_terms[:30],
-            "go_relationships_sample": go_rels[:40],
-            "articles_sample": articles[:25],
-            "article_relationships_sample": {
-                "cited_in": article_rels.get("cited_in", [])[:40],
-                "feature_evidenced_by": article_rels.get("feature_evidenced_by", [])[:40],
-            },
         }
 
     def _build_messages(
@@ -135,31 +138,15 @@ class ProteinDescriptionLLMClient:
         (protein, features, GO terms, relationships, and articles) while
         truncating very large article full-text fields for token safety.
         """
-        packed: dict[str, Any] = {}
-        for acc, ctx in contexts.items():
-            articles = ctx.get("articles", []) or []
-            packed_articles: list[dict[str, Any]] = []
-            for article in articles:
-                if not isinstance(article, dict):
-                    continue
-                art = dict(article)
-                full_text = art.get("full_text")
-                if isinstance(full_text, str):
-                    art["full_text_excerpt"] = full_text[:1200]
-                    art["full_text_char_count"] = len(full_text)
-                    art.pop("full_text", None)
-                packed_articles.append(art)
-
-            packed[acc] = {
-                "protein": ctx.get("protein"),
+        return {
+            acc: {
+                "protein": self._trim_protein(ctx.get("protein") or {}),
+                "counts": {"features": len(ctx.get("features", []))},
                 "features": ctx.get("features", []),
                 "feature_relationships": ctx.get("feature_relationships", []),
-                "go_terms": ctx.get("go_terms", []),
-                "go_relationships": ctx.get("go_relationships", []),
-                "articles": packed_articles,
-                "article_relationships": ctx.get("article_relationships", {}),
             }
-        return packed
+            for acc, ctx in contexts.items()
+        }
 
     def _chat(self, messages: list[dict[str, str]]) -> str:
         payload = {
