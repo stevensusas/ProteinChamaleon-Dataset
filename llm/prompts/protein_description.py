@@ -24,11 +24,11 @@ def build_user_prompt(
         "Write flowing scientific prose with no headers, bullets, or numbered lists. "
         "Cover the protein's identity and function, its key structural features and domains, "
         "and any available structural evidence from PDB or AlphaFold entries. "
-        "When referencing a structure file, insert a placeholder in the form "
-        "[structure/<filename>] inline at the relevant point in the text. "
-        "Only use filenames that appear in the structure file manifest below. "
+        "When referencing a structure, insert its placeholder exactly as it appears "
+        "in the 'placeholder' field of the structure manifest below, inline at the "
+        "relevant point in the text. Only use placeholders from the manifest. "
         "Do not invent or speculate beyond what the context provides.\n\n"
-        f"Structure file manifest:\n{structure_files}\n\n"
+        f"Structure manifest:\n{structure_files}\n\n"
         f"Context JSON:\n{context}"
     )
 
