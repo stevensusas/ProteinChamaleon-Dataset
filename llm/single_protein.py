@@ -44,6 +44,8 @@ def _safe_name(value: str) -> str:
 
 
 def _download_file(url: str, path: Path) -> bool:
+    if path.exists() and path.stat().st_size > 0:
+        return True  # already downloaded
     try:
         with httpx.Client(timeout=45.0, follow_redirects=True) as client:
             resp = client.get(url)

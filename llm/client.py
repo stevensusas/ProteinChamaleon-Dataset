@@ -106,9 +106,8 @@ class ProteinDescriptionLLMClient:
 
         return {
             "protein": self._trim_protein(protein),
-            "counts": {"features": len(features)},
-            "features_sample": features[:20],
-            "feature_relationships_sample": feature_rels[:30],
+            "features": features,
+            "feature_relationships": feature_rels,
         }
 
     def _build_messages(
