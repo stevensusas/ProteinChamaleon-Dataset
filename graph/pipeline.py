@@ -2,18 +2,15 @@
 Graph expansion pipeline for the ProteinChameleon knowledge graph.
 
 Starting from a set of seed proteins, the pipeline:
-  1. Fetches full annotations for each protein from all 8 APIs
-  2. Writes nodes and edges to Neo4j
+  1. Fetches full annotations for each protein from UniProt, PDB, AlphaFold, InterPro
+  2. Writes Protein and ProteinFeature nodes with HAS_FEATURE edges to Neo4j
   3. Discovers interaction partners (STRING) and enqueues them for BFS expansion
 
 The graph grows outward from seeds until no new partners are found above the
 score threshold, or an optional protein cap is reached.
 
-When workers > 1 the BFS is executed by a thread pool so multiple proteins
-are annotated and written concurrently.
-
-Node types written:   Protein, ProteinFeature, GOTerm
-Edge types written:   INTERACTS_WITH, HAS_GO_ANNOTATION, HAS_FEATURE
+Node types written:   Protein, ProteinFeature
+Edge types written:   INTERACTS_WITH, HAS_FEATURE
 """
 
 from __future__ import annotations
@@ -21,7 +18,6 @@ from __future__ import annotations
 import json
 import logging
 import queue
-import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -31,10 +27,8 @@ from typing import Any, Optional
 from clients.uniprot import UniProtClient
 from clients.interpro import InterProClient
 from clients.string_db import STRINGClient
-from clients.go_client import GOClient
 from clients.alphafold import AlphaFoldClient
 from clients.pdb import PDBClient
-from clients.pubmed import PubMedClient
 
 from .neo4j_client import Neo4jClient
 
@@ -45,10 +39,8 @@ _API_CONCURRENCY = {
     "uniprot": 3,
     "interpro": 2,
     "string": 1,
-    "go": 2,
     "alphafold": 2,
     "pdb": 3,
-    "pubmed": 3,
 }
 
 
@@ -61,14 +53,10 @@ class GraphExpansionPipeline:
       - Fetch PDB → add pdb_ids to Protein
       - Fetch AlphaFold → add alphafold structure links
       - Fetch InterPro → write ProteinFeature nodes + HAS_FEATURE edges
-      - Fetch GO (QuickGO) → write GOTerm nodes + HAS_GO_ANNOTATION edges
       - Fetch STRING → write INTERACTS_WITH edges, enqueue unseen partners
 
     Expansion continues until the BFS queue is exhausted or max_proteins is hit.
     """
-
-    _PMID_RE = re.compile(r"PMID[:\s]?(\d+)", re.IGNORECASE)
-    _PMC_FULL_TEXT_MAX_CHARS = 100_000
 
     def __init__(
         self,
@@ -82,23 +70,14 @@ class GraphExpansionPipeline:
         self.max_proteins = max_proteins
         self.workers = max(1, workers)
 
-        # Initialise API clients with per-API concurrency semaphores
         self.uniprot = UniProtClient(max_concurrency=_API_CONCURRENCY["uniprot"])
         self.interpro = InterProClient(max_concurrency=_API_CONCURRENCY["interpro"])
         self.string_db = STRINGClient(max_concurrency=_API_CONCURRENCY["string"])
-        self.go = GOClient(max_concurrency=_API_CONCURRENCY["go"])
         self.alphafold = AlphaFoldClient(max_concurrency=_API_CONCURRENCY["alphafold"])
         self.pdb = PDBClient(max_concurrency=_API_CONCURRENCY["pdb"])
-        self.pubmed = PubMedClient(max_concurrency=_API_CONCURRENCY["pubmed"])
-
-        self._pubmed_cache: dict[str, dict] = {}
-        self._pubmed_lock = threading.Lock()
 
     def close(self) -> None:
-        for client in (
-            self.uniprot, self.interpro, self.string_db,
-            self.go, self.alphafold, self.pdb, self.pubmed,
-        ):
+        for client in (self.uniprot, self.interpro, self.string_db, self.alphafold, self.pdb):
             client.close()
 
     def __enter__(self) -> "GraphExpansionPipeline":
@@ -263,8 +242,8 @@ class GraphExpansionPipeline:
             logger.warning("matplotlib not installed — skipping growth chart.")
             return
 
-        node_labels = ["Protein", "ProteinFeature", "GOTerm", "PubMedArticle"]
-        edge_labels = ["INTERACTS_WITH", "HAS_FEATURE", "HAS_GO_ANNOTATION", "CITED_IN"]
+        node_labels = ["Protein", "ProteinFeature"]
+        edge_labels = ["INTERACTS_WITH", "HAS_FEATURE"]
 
         x = [s["elapsed_s"] for s in snapshots]
 
@@ -299,101 +278,8 @@ class GraphExpansionPipeline:
 
     # ── Per-protein processing ────────────────────────────────────────────────
 
-    def _extract_pmids(self, value: Any) -> set[str]:
-        """Recursively extract PMID values from strings / nested dicts / lists."""
-        pmids: set[str] = set()
-
-        def walk(v: Any) -> None:
-            if v is None:
-                return
-            if isinstance(v, str):
-                pmids.update(self._PMID_RE.findall(v))
-                return
-            if isinstance(v, dict):
-                for child in v.values():
-                    walk(child)
-                return
-            if isinstance(v, (list, tuple, set)):
-                for child in v:
-                    walk(child)
-
-        walk(value)
-        return pmids
-
-    def _ensure_pubmed_articles(self, s, pmids: set[str]) -> None:
-        """Ensure PubMedArticle nodes exist for PMID evidence."""
-        with self._pubmed_lock:
-            missing = [pmid for pmid in pmids if pmid not in self._pubmed_cache]
-
-        if missing:
-            try:
-                articles = self.pubmed.fetch_by_pmids(missing)
-                fetched = {a.pmid: a for a in articles}
-                with self._pubmed_lock:
-                    for pmid in missing:
-                        if pmid in self._pubmed_cache:
-                            continue
-                        article = fetched.get(pmid)
-                        if article:
-                            full_text = ""
-                            if article.pmc:
-                                pmc_text = self.pubmed.fetch_pmc_full_text(article.pmc)
-                                if pmc_text:
-                                    full_text = pmc_text[: self._PMC_FULL_TEXT_MAX_CHARS]
-                            self._pubmed_cache[pmid] = {
-                                "pmid": article.pmid,
-                                "title": article.title or "",
-                                "abstract": article.abstract or "",
-                                "journal": article.journal or "",
-                                "journal_abbrev": article.journal_abbrev or "",
-                                "year": article.year or "",
-                                "volume": article.volume or "",
-                                "issue": article.issue or "",
-                                "pages": article.pages or "",
-                                "doi": article.doi or "",
-                                "pmc": article.pmc or "",
-                                "pubmed_url": article.pubmed_url,
-                                "authors": article.author_names,
-                                "mesh_terms": article.mesh_terms,
-                                "publication_types": article.publication_types,
-                                "full_text": full_text,
-                            }
-                        else:
-                            self._pubmed_cache[pmid] = {"pmid": pmid}
-            except Exception as exc:
-                logger.warning("PubMed fetch failed for %d PMID(s): %s", len(missing), exc)
-                with self._pubmed_lock:
-                    for pmid in missing:
-                        if pmid not in self._pubmed_cache:
-                            self._pubmed_cache[pmid] = {"pmid": pmid}
-
-        with self._pubmed_lock:
-            cached = {pmid: self._pubmed_cache[pmid] for pmid in pmids if pmid in self._pubmed_cache}
-        for pmid, props in cached.items():
-            self.neo4j.merge_pubmed_article(s, props)
-
-    def _link_go_evidence(self, s, protein_acc: str, reference: Optional[str]) -> None:
-        """Attach PubMed evidence for GO annotations via Protein -> CITED_IN."""
-        pmids = self._extract_pmids(reference)
-        if not pmids:
-            return
-        self._ensure_pubmed_articles(s, pmids)
-        for pmid in pmids:
-            self.neo4j.merge_cited_in(s, protein_acc, pmid)
-
-    def _link_feature_evidence(
-        self, s, protein_acc: str, feature_acc: str, evidence_blob: Any
-    ) -> None:
-        """Attach PubMed evidence for protein feature matches."""
-        pmids = self._extract_pmids(evidence_blob)
-        if not pmids:
-            return
-        self._ensure_pubmed_articles(s, pmids)
-        for pmid in pmids:
-            self.neo4j.merge_feature_evidence(s, protein_acc, feature_acc, pmid)
-
     def _write_protein_node(self, accession: str, entry) -> None:
-        """Build full protein props (UniProt + PDB + AlphaFold), merge node, write InterPro and GO."""
+        """Build full protein props (UniProt + PDB + AlphaFold), merge node, write InterPro."""
         protein_props = {
             "accession": entry.primaryAccession,
             "name": entry.protein_name or "",
@@ -409,7 +295,6 @@ class GraphExpansionPipeline:
             "string_id": entry.get_string_id() or "",
         }
 
-        # PDB structures (from PDB Search API)
         try:
             pdb_result = self.pdb.search_by_uniprot(accession, max_rows=100)
             pdb_ids = pdb_result.identifiers
@@ -430,7 +315,6 @@ class GraphExpansionPipeline:
             protein_props["pdb_cif_urls"] = []
             protein_props["pdb_pdb_urls"] = []
 
-        # AlphaFold structure (from AlphaFold API)
         try:
             preds = self.alphafold.get_prediction(accession)
             protein_props["alphafold_entry_ids"] = [p.entryId for p in preds]
@@ -455,7 +339,6 @@ class GraphExpansionPipeline:
             self.neo4j.merge_protein(s, protein_props)
 
         self._write_interpro(accession)
-        self._write_go_annotations(accession)
 
     def _process_protein(self, accession: str) -> list[str]:
         """
@@ -509,63 +392,6 @@ class GraphExpansionPipeline:
                         self.neo4j.merge_has_feature(
                             s, accession, meta.accession, edge_props
                         )
-                # InterPro sometimes contains PMID references in nested metadata payloads.
-                self._link_feature_evidence(
-                    s, accession, meta.accession, match.model_dump()
-                )
-
-    # ── GO annotations ────────────────────────────────────────────────────────
-
-    def _write_go_annotations(self, accession: str) -> None:
-        try:
-            annotations = self.go.get_annotations(accession)
-        except Exception as exc:
-            logger.warning("GO fetch failed for %s: %s", accession, exc)
-            return
-
-        # Collect unique GO IDs to fetch term details
-        go_ids = list({a.goId for a in annotations})
-        go_terms: dict[str, dict] = {}
-
-        # Batch fetch term details (up to 10 at a time)
-        batch_size = 10
-        for i in range(0, len(go_ids), batch_size):
-            batch = go_ids[i : i + batch_size]
-            try:
-                terms = self.go.get_terms_batch(batch)
-                for t in terms:
-                    go_terms[t.id] = {
-                        "go_id": t.id,
-                        "name": t.name,
-                        "aspect": t.aspect or "",
-                        "definition": t.definition_text,
-                        "is_obsolete": t.isObsolete,
-                    }
-            except Exception as exc:
-                logger.warning("GO term batch fetch failed: %s", exc)
-
-        with self.neo4j.session() as s:
-            for ann in annotations:
-                # Ensure GOTerm node exists
-                term_props = go_terms.get(ann.goId, {
-                    "go_id": ann.goId,
-                    "name": ann.goName or "",
-                    "aspect": ann.goAspect or "",
-                    "definition": "",
-                    "is_obsolete": False,
-                })
-                self.neo4j.merge_go_term(s, term_props)
-
-                edge_props = {
-                    "qualifier": ann.qualifier or "",
-                    "evidence_code": ann.goEvidence or "",
-                    "eco_code": ann.evidenceCode or "",
-                    "reference": ann.reference or "",
-                    "assigned_by": ann.assignedBy or "",
-                    "is_experimental": ann.is_experimental,
-                }
-                self.neo4j.merge_go_annotation(s, accession, ann.goId, edge_props)
-                self._link_go_evidence(s, accession, ann.reference)
 
     # ── STRING PPI ────────────────────────────────────────────────────────────
 
@@ -626,7 +452,6 @@ class GraphExpansionPipeline:
         Falls back to gene name search if cross-reference lookup fails.
         """
         try:
-            # Search UniProt for this gene in this organism
             results = list(self.uniprot.search(
                 f"gene:{gene_name} AND organism_id:{taxon_id} AND reviewed:true",
                 size=1,
@@ -637,7 +462,6 @@ class GraphExpansionPipeline:
             pass
 
         try:
-            # Fallback: search unreviewed too
             results = list(self.uniprot.search(
                 f"gene:{gene_name} AND organism_id:{taxon_id}",
                 size=1,

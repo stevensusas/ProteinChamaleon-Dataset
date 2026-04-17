@@ -1,7 +1,8 @@
 # Neo4j for ProteinChameleon demo
 # Start: docker compose up -d
 # Stop:  docker compose down
-# Browser: http://localhost:7474 (user: neo4j, password: password)
+# Wipe data: docker compose down -v
+# Browser: http://localhost:7474 (user: neo4j, password: password123)
 
 services:
   neo4j:
@@ -10,9 +11,14 @@ services:
       - "7474:7474"   # HTTP (Browser)
       - "7687:7687"   # Bolt
     environment:
-      NEO4J_AUTH: neo4j/password
+      NEO4J_AUTH: neo4j/password123
+    volumes:
+      - neo4j_data:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7474"]
       interval: 5s
       timeout: 5s
       retries: 10
+
+volumes:
+  neo4j_data:

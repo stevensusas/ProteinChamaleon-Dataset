@@ -1,9 +1,8 @@
 """
 Neo4j graph client for the ProteinChameleon knowledge graph.
 
-Node labels:    Protein, PubMedArticle, ProteinFeature, GOTerm, Pathway
-Relationships:  INTERACTS_WITH, HAS_GO_ANNOTATION, HAS_FEATURE,
-                EVIDENCED_BY, CITED_IN, IN_PATHWAY, ENZYMATIC_REACTION
+Node labels:    Protein, ProteinFeature
+Relationships:  INTERACTS_WITH, HAS_FEATURE
 """
 
 from __future__ import annotations
@@ -20,19 +19,14 @@ logger = logging.getLogger(__name__)
 # ── Cypher constraint / index setup ──────────────────────────────────────────
 
 CONSTRAINTS = [
-    "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Protein)       REQUIRE p.accession IS UNIQUE",
-    "CREATE CONSTRAINT IF NOT EXISTS FOR (a:PubMedArticle) REQUIRE a.pmid IS UNIQUE",
+    "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Protein)        REQUIRE p.accession IS UNIQUE",
     "CREATE CONSTRAINT IF NOT EXISTS FOR (f:ProteinFeature) REQUIRE f.accession IS UNIQUE",
-    "CREATE CONSTRAINT IF NOT EXISTS FOR (g:GOTerm)        REQUIRE g.go_id IS UNIQUE",
-    "CREATE CONSTRAINT IF NOT EXISTS FOR (pw:Pathway)      REQUIRE pw.kegg_id IS UNIQUE",
 ]
 
 INDEXES = [
-    "CREATE INDEX IF NOT EXISTS FOR (p:Protein)       ON (p.gene_name)",
-    "CREATE INDEX IF NOT EXISTS FOR (p:Protein)       ON (p.taxon_id)",
-    "CREATE INDEX IF NOT EXISTS FOR (g:GOTerm)        ON (g.aspect)",
+    "CREATE INDEX IF NOT EXISTS FOR (p:Protein)        ON (p.gene_name)",
+    "CREATE INDEX IF NOT EXISTS FOR (p:Protein)        ON (p.taxon_id)",
     "CREATE INDEX IF NOT EXISTS FOR (f:ProteinFeature) ON (f.source_database)",
-    "CREATE INDEX IF NOT EXISTS FOR (pw:Pathway)      ON (pw.name)",
 ]
 
 
@@ -100,17 +94,6 @@ class Neo4jClient:
             props=props,
         )
 
-    def merge_pubmed_article(self, s: Session, props: dict) -> None:
-        """Upsert a PubMedArticle node keyed on pmid."""
-        s.run(
-            """
-            MERGE (a:PubMedArticle {pmid: $pmid})
-            SET a += $props
-            """,
-            pmid=props["pmid"],
-            props=props,
-        )
-
     def merge_protein_feature(self, s: Session, props: dict) -> None:
         """Upsert a ProteinFeature node (InterPro entry) keyed on accession."""
         s.run(
@@ -119,28 +102,6 @@ class Neo4jClient:
             SET f += $props
             """,
             accession=props["accession"],
-            props=props,
-        )
-
-    def merge_go_term(self, s: Session, props: dict) -> None:
-        """Upsert a GOTerm node keyed on go_id."""
-        s.run(
-            """
-            MERGE (g:GOTerm {go_id: $go_id})
-            SET g += $props
-            """,
-            go_id=props["go_id"],
-            props=props,
-        )
-
-    def merge_pathway(self, s: Session, props: dict) -> None:
-        """Upsert a KEGG Pathway node keyed on kegg_id."""
-        s.run(
-            """
-            MERGE (pw:Pathway {kegg_id: $kegg_id})
-            SET pw += $props
-            """,
-            kegg_id=props["kegg_id"],
             props=props,
         )
 
@@ -166,23 +127,6 @@ class Neo4jClient:
             props=props,
         )
 
-    def merge_go_annotation(
-        self, s: Session, protein_acc: str, go_id: str, props: dict
-    ) -> None:
-        """HAS_GO_ANNOTATION: (Protein)-[:HAS_GO_ANNOTATION]->(GOTerm)"""
-        s.run(
-            """
-            MATCH (p:Protein {accession: $acc})
-            MATCH (g:GOTerm {go_id: $go_id})
-            MERGE (p)-[r:HAS_GO_ANNOTATION {go_id: $go_id, qualifier: $qualifier}]->(g)
-            SET r += $props
-            """,
-            acc=protein_acc,
-            go_id=go_id,
-            qualifier=props.get("qualifier", ""),
-            props=props,
-        )
-
     def merge_has_feature(
         self,
         s: Session,
@@ -205,76 +149,53 @@ class Neo4jClient:
             props=props,
         )
 
-    def merge_feature_evidence(
-        self, s: Session, protein_acc: str, feature_acc: str, pmid: str
-    ) -> None:
-        """
-        EVIDENCED_BY: link a protein's feature match to a PubMed article.
-        Models: (Protein)-[:HAS_FEATURE]->(Feature)-[:EVIDENCED_BY]->(Article)
-        We also add a direct CITED_IN from Protein → Article.
-        """
-        s.run(
-            """
-            MATCH (p:Protein {accession: $acc})
-            MATCH (f:ProteinFeature {accession: $feat_acc})
-            MATCH (a:PubMedArticle {pmid: $pmid})
-            MERGE (p)-[:CITED_IN]->(a)
-            MERGE (f)-[:EVIDENCED_BY]->(a)
-            """,
-            acc=protein_acc,
-            feat_acc=feature_acc,
-            pmid=pmid,
-        )
+    # ── Batch upserts (UNWIND) ────────────────────────────────────────────────
 
-    def merge_cited_in(self, s: Session, protein_acc: str, pmid: str) -> None:
-        """CITED_IN: (Protein)-[:CITED_IN]->(PubMedArticle)"""
-        s.run(
-            """
-            MATCH (p:Protein {accession: $acc})
-            MATCH (a:PubMedArticle {pmid: $pmid})
-            MERGE (p)-[:CITED_IN]->(a)
-            """,
-            acc=protein_acc,
-            pmid=pmid,
-        )
+    def merge_proteins_batch(self, batch: list[dict]) -> None:
+        """Upsert a batch of Protein nodes in a single transaction."""
+        with self.session() as s:
+            s.run(
+                """
+                UNWIND $batch AS props
+                MERGE (p:Protein {accession: props.accession})
+                SET p += props
+                """,
+                batch=batch,
+            )
 
-    def merge_in_pathway(
-        self, s: Session, protein_acc: str, kegg_id: str, props: dict
-    ) -> None:
-        """IN_PATHWAY: (Protein)-[:IN_PATHWAY]->(Pathway)"""
-        s.run(
-            """
-            MATCH (p:Protein {accession: $acc})
-            MATCH (pw:Pathway {kegg_id: $kegg_id})
-            MERGE (p)-[r:IN_PATHWAY]->(pw)
-            SET r += $props
-            """,
-            acc=protein_acc,
-            kegg_id=kegg_id,
-            props=props,
-        )
+    def merge_features_batch(self, batch: list[dict]) -> None:
+        """Upsert a batch of ProteinFeature nodes in a single transaction."""
+        with self.session() as s:
+            s.run(
+                """
+                UNWIND $batch AS props
+                MERGE (f:ProteinFeature {accession: props.accession})
+                SET f += props
+                """,
+                batch=batch,
+            )
 
-    def merge_enzymatic_relation(
-        self, s: Session, acc_a: str, acc_b: str, props: dict
-    ) -> None:
+    def merge_has_feature_batch(self, batch: list[dict]) -> None:
         """
-        ENZYMATIC_REACTION: two proteins linked by a shared enzyme (EC number)
-        within the same KEGG pathway.
-        (Protein)-[:ENZYMATIC_REACTION]->(Protein)
+        Upsert a batch of HAS_FEATURE edges in a single transaction.
+        Each dict: {protein_acc, feature_acc, start, end}
+        Silently skips rows where Protein or ProteinFeature is missing.
         """
-        s.run(
-            """
-            MATCH (a:Protein {accession: $acc_a})
-            MATCH (b:Protein {accession: $acc_b})
-            MERGE (a)-[r:ENZYMATIC_REACTION {ec_number: $ec, pathway_id: $pathway}]->(b)
-            SET r += $props
-            """,
-            acc_a=acc_a,
-            acc_b=acc_b,
-            ec=props.get("ec_number", ""),
-            pathway=props.get("pathway_id", ""),
-            props=props,
-        )
+        with self.session() as s:
+            s.run(
+                """
+                UNWIND $batch AS row
+                MATCH (p:Protein {accession: row.protein_acc})
+                MATCH (f:ProteinFeature {accession: row.feature_acc})
+                MERGE (p)-[r:HAS_FEATURE {
+                    protein: row.protein_acc,
+                    feature: row.feature_acc,
+                    start: row.start,
+                    end: row.end
+                }]->(f)
+                """,
+                batch=batch,
+            )
 
     # ── Query helpers ─────────────────────────────────────────────────────────
 
@@ -289,8 +210,6 @@ class Neo4jClient:
         Return one protein and its connected context:
         - Protein node properties
         - ProteinFeature nodes + HAS_FEATURE relationships
-        - GOTerm nodes + HAS_GO_ANNOTATION relationships
-        - PubMedArticle nodes + CITED_IN / EVIDENCED_BY relationships
         """
         with self.session() as s:
             protein_row = s.run(
@@ -302,18 +221,7 @@ class Neo4jClient:
             ).single()
 
             if not protein_row:
-                return {
-                    "protein": None,
-                    "features": [],
-                    "feature_relationships": [],
-                    "go_terms": [],
-                    "go_relationships": [],
-                    "articles": [],
-                    "article_relationships": {
-                        "cited_in": [],
-                        "feature_evidenced_by": [],
-                    },
-                }
+                return {"protein": None, "features": [], "feature_relationships": []}
 
             feature_rows = s.run(
                 """
@@ -326,80 +234,12 @@ class Neo4jClient:
             feature_relationships: list[dict[str, Any]] = []
             for row in feature_rows:
                 feature = row["feature"]
-                rel_props = row["rel_props"]
                 features.append(feature)
                 feature_relationships.append(
                     {
                         "protein_accession": accession,
                         "feature_accession": feature.get("accession", ""),
-                        "properties": rel_props,
-                    }
-                )
-
-            go_rows = s.run(
-                """
-                MATCH (p:Protein {accession: $acc})-[r:HAS_GO_ANNOTATION]->(g:GOTerm)
-                RETURN properties(g) AS go_term, properties(r) AS rel_props
-                """,
-                acc=accession,
-            )
-            go_terms: list[dict[str, Any]] = []
-            go_relationships: list[dict[str, Any]] = []
-            for row in go_rows:
-                go_term = row["go_term"]
-                rel_props = row["rel_props"]
-                go_terms.append(go_term)
-                go_relationships.append(
-                    {
-                        "protein_accession": accession,
-                        "go_id": go_term.get("go_id", ""),
-                        "properties": rel_props,
-                    }
-                )
-
-            cited_rows = s.run(
-                """
-                MATCH (p:Protein {accession: $acc})-[r:CITED_IN]->(a:PubMedArticle)
-                RETURN properties(a) AS article, properties(r) AS rel_props
-                """,
-                acc=accession,
-            )
-            articles_by_pmid: dict[str, dict[str, Any]] = {}
-            cited_in_relationships: list[dict[str, Any]] = []
-            for row in cited_rows:
-                article = row["article"]
-                rel_props = row["rel_props"]
-                pmid = article.get("pmid", "")
-                if pmid:
-                    articles_by_pmid[pmid] = article
-                cited_in_relationships.append(
-                    {
-                        "protein_accession": accession,
-                        "pmid": pmid,
-                        "properties": rel_props,
-                    }
-                )
-
-            evidence_rows = s.run(
-                """
-                MATCH (p:Protein {accession: $acc})-[:HAS_FEATURE]->(f:ProteinFeature)-[r:EVIDENCED_BY]->(a:PubMedArticle)
-                RETURN properties(f) AS feature, properties(a) AS article, properties(r) AS rel_props
-                """,
-                acc=accession,
-            )
-            feature_evidence_relationships: list[dict[str, Any]] = []
-            for row in evidence_rows:
-                feature = row["feature"]
-                article = row["article"]
-                rel_props = row["rel_props"]
-                pmid = article.get("pmid", "")
-                if pmid:
-                    articles_by_pmid[pmid] = article
-                feature_evidence_relationships.append(
-                    {
-                        "feature_accession": feature.get("accession", ""),
-                        "pmid": pmid,
-                        "properties": rel_props,
+                        "properties": row["rel_props"],
                     }
                 )
 
@@ -407,13 +247,6 @@ class Neo4jClient:
                 "protein": protein_row["protein"],
                 "features": features,
                 "feature_relationships": feature_relationships,
-                "go_terms": go_terms,
-                "go_relationships": go_relationships,
-                "articles": list(articles_by_pmid.values()),
-                "article_relationships": {
-                    "cited_in": cited_in_relationships,
-                    "feature_evidenced_by": feature_evidence_relationships,
-                },
             }
 
     def get_counts(self) -> dict[str, int]:
